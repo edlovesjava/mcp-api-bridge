@@ -1,0 +1,188 @@
+# mcp-api-bridge configuration
+#
+# Copy to config/catalog.yaml (git-ignored) and edit for your catalogs.
+# Nothing here is secret: `auth` blocks name the environment variable to read
+# at request time.
+
+version: 1
+
+defaults:
+  timeout_seconds: 20
+  max_retries: 2
+  page_size: 20
+
+bedrock:
+  # Region for the query-understanding calls. Defaults to $AWS_REGION.
+  region: us-east-1
+  model_id: anthropic.claude-opus-5
+  # Query understanding sits in front of every smart_search, so it runs at
+  # low effort by default. Raise it if your filter vocabulary is large or
+  # your users write long, compound queries.
+  effort: low
+  # Optional house vocabulary appended to the query-understanding prompt.
+  guidance: |
+    Internal shorthand you may encounter:
+    - "SKU" and "article number" both refer to the product id.
+    - "clearance" means the discounted filter, not a category.
+
+apis:
+  # ---------------------------------------------------------------------
+  # A GET-based search API with a nested response envelope.
+  # ---------------------------------------------------------------------
+  - name: product_catalog
+    description: Main retail product catalog covering apparel, footwear, and home goods.
+    base_url: https://catalog.internal.example.com
+    auth:
+      type: bearer
+      token_env: CATALOG_TOKEN
+    headers:
+      X-Client: mcp-api-bridge
+
+    search:
+      method: GET
+      path: /api/v2/products/search
+      # Values are templates. {query}, {page}, {page_size}, and {sort} are
+      # filled in per request; anything unfilled drops out of the request.
+      query:
+        q: "{query}"
+        page: "{page}"
+        size: "{page_size}"
+        sort: "{sort}"
+        channel: web # a static param — no placeholder, always sent
+      first_page: 1
+
+      # Logical filter name -> upstream param. The `description`, `type`, and
+      # `values` here are exactly what the Bedrock query-understanding step
+      # reads, so write them for someone who has never seen this API.
+      filters:
+        category:
+          param: categoryId
+          type: string
+          description: Top-level merchandising category.
+          values: [footwear, apparel, home, electronics]
+        brand:
+          param: brand
+          type: string
+          description: Brand name, exactly as printed on the product.
+          style: repeat # repeat the param once per value; use `csv` to join
+        price_min:
+          param: priceFrom
+          type: number
+          description: Minimum price in USD.
+        price_max:
+          param: priceTo
+          type: number
+          description: Maximum price in USD.
+        in_stock:
+          param: availableOnly
+          type: boolean
+          description: Restrict to items currently in stock.
+        color:
+          param: color
+          type: string
+          description: Primary product colour.
+
+      sorts:
+        - name: relevance
+          value: score_desc
+          description: Best keyword match first. The catalog default.
+        - name: price_low_to_high
+          value: price_asc
+          description: Cheapest first — use for "cheapest", "budget", "under $X".
+        - name: price_high_to_low
+          value: price_desc
+          description: Most expensive first — use for "premium", "top of the line".
+        - name: newest
+          value: created_desc
+          description: Most recently added first.
+
+      # How to read the response body back.
+      response:
+        items_path: data.items
+        total_path: data.totalCount
+        fields:
+          id: sku
+          title: name
+          description: longDescription
+          url: links.pdp
+          image: media[0].url
+        # Anything extra worth surfacing to the caller.
+        attributes:
+          brand: brand.name
+          price: pricing.current
+          currency: pricing.currency
+          in_stock: inventory.available
+
+    get_item:
+      method: GET
+      path: /api/v2/products/{id}
+      response:
+        item_path: data
+        fields:
+          id: sku
+          title: name
+          description: longDescription
+          url: links.pdp
+          image: media[0].url
+        attributes:
+          brand: brand.name
+          price: pricing.current
+          specs: specifications
+
+  # ---------------------------------------------------------------------
+  # A POST-based search API with a flat response and an API-key header.
+  # ---------------------------------------------------------------------
+  - name: parts_catalog
+    description: Industrial spare parts catalog, searchable by part number and fitment.
+    base_url: https://parts.internal.example.com
+    auth:
+      type: api_key
+      key_env: PARTS_API_KEY
+      header: X-API-Key
+    page_size: 50
+
+    search:
+      method: POST
+      path: /search
+      body:
+        text: "{query}"
+        offset: "{page}"
+        limit: "{page_size}"
+        orderBy: "{sort}"
+      first_page: 0 # this API pages from zero
+
+      filters:
+        manufacturer:
+          param: manufacturer
+          type: string
+          location: body
+          description: Part manufacturer name.
+        fits_model:
+          param: fitment
+          type: string
+          location: body
+          description: Equipment model the part is compatible with.
+        min_quantity:
+          param: minQty
+          type: integer
+          location: body
+          description: Minimum warehouse quantity on hand.
+
+      sorts:
+        - name: relevance
+          value: relevance
+          description: Best match first.
+        - name: part_number
+          value: partNumber
+          description: Ascending part number — use when the user wants a catalogue listing.
+
+      response:
+        items_path: results
+        total_path: count
+        fields:
+          id: partNumber
+          title: description
+          url: detailUrl
+        attributes:
+          manufacturer: manufacturer
+          quantity: stock.onHand
