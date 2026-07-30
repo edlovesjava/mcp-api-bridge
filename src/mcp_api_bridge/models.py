@@ -30,6 +30,14 @@ class SearchResult(BaseModel):
     page_size: int
     filters_applied: dict[str, Any] = Field(default_factory=dict)
     sort: str | None = None
+    resolutions: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "What each name-valued filter resolved to, e.g. "
+            '{"performer": {"name": "Taylor Swift", "id": "9134"}}. Ambiguous '
+            "names resolve to a best guess — check this before trusting results."
+        ),
+    )
 
 
 class FilterSelection(BaseModel):

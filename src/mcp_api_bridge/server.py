@@ -54,6 +54,14 @@ class FilterInfo(BaseModel):
     type: str
     description: str
     allowed_values: list[str] | None = None
+    accepts_name: bool = Field(
+        default=False,
+        description=(
+            "True when this filter is keyed by an opaque id but accepts a human "
+            "name, which the bridge resolves for you. Pass the name; never an id "
+            "you guessed."
+        ),
+    )
 
 
 class SortInfo(BaseModel):
@@ -121,7 +129,10 @@ class Bridge:
         await self.catalog.aclose()
 
 
-def _describe(api: ApiConfig, config: BridgeConfig) -> CatalogInfo:
+def _describe(
+    api: ApiConfig, config: BridgeConfig, values: dict[str, list[str]] | None = None
+) -> CatalogInfo:
+    values = values or {}
     return CatalogInfo(
         name=api.name,
         description=api.description,
@@ -130,7 +141,8 @@ def _describe(api: ApiConfig, config: BridgeConfig) -> CatalogInfo:
                 name=name,
                 type=spec.type,
                 description=spec.description,
-                allowed_values=spec.values,
+                allowed_values=values.get(name) or spec.values,
+                accepts_name=spec.resolves_names,
             )
             for name, spec in api.search.filters.items()
         ],
@@ -171,10 +183,18 @@ def build_server(
         Returns every catalog's filter names, types, allowed values, and sort
         options. Call this before `catalog_search` so you filter with names the
         catalog actually exposes.
+
+        Filters marked `accepts_name` are keyed by an opaque id upstream but
+        take a human name here — pass "Chicago", not a region id. Where the
+        value set is closed it is listed in `allowed_values`; where it is open
+        (performers, venues) any name is accepted and resolved on the way
+        through.
         """
         cfg = active.config
         return CatalogList(
-            catalogs=[_describe(api, cfg) for api in cfg.apis],
+            catalogs=[
+                _describe(api, cfg, await active.catalog.vocabulary(api)) for api in cfg.apis
+            ],
             default_catalog=cfg.apis[0].name if len(cfg.apis) == 1 else None,
         )
 
@@ -194,7 +214,9 @@ def build_server(
                 a phrase like "under $80" left in the query fights the filter.
             api: Which catalog to search. Optional when only one is configured.
             filters: Filter names from `list_catalogs` mapped to values. A list
-                value means "any of these".
+                value means "any of these". For `accepts_name` filters pass the
+                human name — the bridge resolves it to the upstream id and
+                reports what it chose in `resolutions`.
             sort: A sort name from `list_catalogs`. Omit for catalog default.
             page: 1-based page number.
             page_size: Results per page. Defaults to the catalog's configured size.
@@ -243,7 +265,8 @@ def build_server(
         """
         target = active.resolve(api)
         try:
-            plan = await active.understanding.understand(target, query)
+            values = await active.catalog.vocabulary(target)
+            plan = await active.understanding.understand(target, query, values)
         except QueryUnderstandingError as exc:
             raise ToolError(str(exc)) from exc
         return UnderstoodQuery(
@@ -276,7 +299,8 @@ def build_server(
         """
         target = active.resolve(api)
         try:
-            plan = await active.understanding.understand(target, query)
+            values = await active.catalog.vocabulary(target)
+            plan = await active.understanding.understand(target, query, values)
         except QueryUnderstandingError as exc:
             raise ToolError(
                 f"{exc} (catalog_search still works — pass the query and filters directly)"

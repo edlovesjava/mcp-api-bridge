@@ -62,6 +62,47 @@ AuthConfig = NoAuth | BearerAuth | ApiKeyAuth | BasicAuth
 # --- request shaping -------------------------------------------------------
 
 
+class LookupConfig(BaseModel):
+    """Resolve a name to an id from a closed set fetched once at first use.
+
+    For filters keyed by an opaque id over a small, slow-changing set —
+    regions, categories, subcategories. The bridge loads the whole table,
+    publishes the *names* as the filter's vocabulary, and translates back to
+    the id on the way out. The model never sees or invents an id.
+
+    This is the only workable strategy when the upstream lookup endpoint has
+    no name search of its own: `GET /v1/regions` filters by IP and lat/long
+    only, so matching "Chicago" means holding the list.
+    """
+
+    path: str
+    method: Literal["GET", "POST"] = "GET"
+    params: dict[str, Any] = Field(default_factory=dict)
+    items_path: str = "items"
+    id_field: str = "id"
+    name_field: str = "name"
+    # Additional columns to accept as names (e.g. a region's `listName`).
+    alias_fields: list[str] = Field(default_factory=list)
+    # Refuse to publish a vocabulary larger than this — a set this big is not
+    # a closed set, and belongs behind `resolve` instead.
+    max_items: int = 2000
+
+
+class ResolveConfig(BaseModel):
+    """Resolve a name to an id by searching another configured catalog.
+
+    For filters keyed by an opaque id over an open set — performers, venues,
+    productions — where no table can be preloaded. The model supplies the
+    name it read in the query; the bridge searches the sibling catalog and
+    substitutes the top hit's id.
+    """
+
+    api: str
+    # Ambiguity is normal here ("Chicago" is a city, a band, and a musical),
+    # so the resolved choice is always reported back to the caller.
+    take: int = 1
+
+
 class FilterConfig(BaseModel):
     """A logical filter, and how it renders into the upstream request.
 
@@ -79,6 +120,24 @@ class FilterConfig(BaseModel):
     # Where the filter goes. `query` covers the overwhelming majority of
     # in-house search APIs; `body` is for POST-based search endpoints.
     location: Literal["query", "body"] = "query"
+    # At most one value-resolution strategy, for id-keyed filters.
+    lookup: LookupConfig | None = None
+    resolve: ResolveConfig | None = None
+
+    @model_validator(mode="after")
+    def _one_resolution_strategy(self) -> FilterConfig:
+        if self.lookup and self.resolve:
+            raise ValueError("a filter may declare `lookup` or `resolve`, not both")
+        if (self.lookup or self.resolve) and self.values:
+            raise ValueError(
+                "`values` is redundant on a lookup/resolve filter — the resolved "
+                "names are the vocabulary"
+            )
+        return self
+
+    @property
+    def resolves_names(self) -> bool:
+        return self.lookup is not None or self.resolve is not None
 
 
 class SortConfig(BaseModel):

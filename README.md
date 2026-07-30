@@ -87,7 +87,8 @@ mcp-api-bridge import-openapi catalog-search-service-api.json \
   -o config/catalog.yaml
 ```
 
-`config/vividseats.example.yaml` is the real output of that command.
+`config/vividseats.example.yaml` was scaffolded this way, then hand-edited for
+the parts below that no spec can supply.
 
 It takes from the spec: base URL, method, path, parameter names, types, enums,
 descriptions, paging defaults, the response envelope, and the auth scheme. It
@@ -112,17 +113,73 @@ query-understanding prompt, so importing all 45 makes the prompt expensive and
 gives the model a wide surface to invent against. The importer nags when an
 uncurated import exceeds 15 filters.
 
-**Two things the spec cannot fix.** Twelve of the productions parameters are
-opaque IDs (`performerId`, `venueId`, `regionId`) whose own descriptions say
-they "can be looked up from the /regions API". No model can turn "Taylor Swift
-in Chicago" into `performerId=…&regionId=…` from vocabulary alone — those
-filters need an entity-resolution hop, which this bridge does not yet have. And
-that spec declares no `securitySchemes` at all, so the importer writes
-`auth: none`; if a gateway fronts the API, that is invisible here.
+**One thing the spec cannot fix.** That spec declares no `securitySchemes` at
+all, so the importer writes `auth: none`; if a gateway fronts the API, that is
+invisible here. (The opaque-id problem it also surfaces is handled — see the
+next section.)
 
 The importer needs no dependencies beyond PyYAML — `$ref`s are resolved on
 demand with cycle guards, because real specs are cyclic (`Production` → `Venue`
 → `Production`).
+
+## Opaque ids: names in, ids out
+
+The best filters on a real catalog are keyed by ids — `regionId`, `performerId`,
+`venueId`, `categoryId`. No model turns *"Taylor Swift in Chicago"* into
+`performerId=9134&regionId=5` from a description, so a filter like that is dead
+weight in the vocabulary. Declaring how a filter's values resolve brings it
+back to life. Two strategies, because there are two shapes of id:
+
+**`lookup` — closed sets** (regions, categories). The bridge fetches the table
+once, publishes the *names* as the filter's vocabulary, and translates back to
+the id on the way out. This is not an optimization: `GET /v1/regions` filters
+by IP and lat/long only, so holding the list is the *only* way to match
+"Chicago".
+
+```yaml
+region:
+  param: regionId
+  type: integer
+  description: Metro area the event's venue sits in.
+  lookup:
+    path: /v1/regions
+    id_field: id
+    name_field: name
+    alias_fields: [listName]     # accept "Chicago, IL" too
+```
+
+**`resolve` — open sets** (performers, venues). No table can be preloaded, so
+the model supplies the name it read and the bridge searches a sibling catalog
+for it. Pointing this at the Algolia-backed search service is deliberate — it
+handles misspellings and partial names, which is exactly what resolution needs.
+
+```yaml
+performer:
+  param: performerId
+  type: integer
+  description: Artist, team, or touring show.
+  resolve:
+    api: performers              # another configured catalog
+```
+
+Either way the caller passes a name and gets told what it became:
+
+```json
+"resolutions": {
+  "performer": {"name": "Taylor Swift", "id": "9134"},
+  "region":    {"name": "Chicago",      "id": "5"}
+}
+```
+
+That readback matters because resolution is a guess where names collide —
+"Chicago" is a city, a band, and a musical. `list_catalogs` marks these filters
+`accepts_name`, listing `allowed_values` for closed sets and leaving it null for
+open ones. An id passed directly still works and skips the lookup entirely; an
+unrecognised name gets a did-you-mean.
+
+`config/vividseats.example.yaml` wires both services together this way:
+catalog-service for authoritative data and the reference tables,
+catalog-search-service for name resolution.
 
 ## Configuring a catalog
 

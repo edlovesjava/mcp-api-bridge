@@ -42,12 +42,31 @@ the head noun the shopper used.
 Do not pad the list.
 """
 
+# A long vocabulary is truncated rather than dropped: a partial list still
+# anchors the model's phrasing, and the bridge validates the choice anyway.
+_MAX_RENDERED_VALUES = 80
+
+
+def _render_values(values: list[str]) -> str:
+    if len(values) <= _MAX_RENDERED_VALUES:
+        return ", ".join(values)
+    head = ", ".join(values[:_MAX_RENDERED_VALUES])
+    return f"{head} (+{len(values) - _MAX_RENDERED_VALUES} more; use an exact name from this set)"
+
+
 _NO_FILTERS = "This catalog exposes no structured filters — put everything in `keywords`."
 _NO_SORTS = "This catalog exposes no sort options — always return null for `sort`."
 
 
-def describe_vocabulary(api: ApiConfig) -> str:
-    """Render an API's filters and sorts as prompt context."""
+def describe_vocabulary(api: ApiConfig, values: dict[str, list[str]] | None = None) -> str:
+    """Render an API's filters and sorts as prompt context.
+
+    `values` carries vocabularies resolved at runtime from the catalog's own
+    lookup endpoints — the actual region and category names. Without them an
+    id-keyed filter is unusable: no model can turn "Chicago" into `regionId=5`
+    from a description alone.
+    """
+    values = values or {}
     lines: list[str] = [f"Catalog: {api.name}"]
     if api.description:
         lines.append(f"Purpose: {api.description}")
@@ -59,8 +78,16 @@ def describe_vocabulary(api: ApiConfig) -> str:
             entry = f"- {name} — {spec.type}"
             if spec.description:
                 entry += f" — {spec.description}"
-            if spec.values:
-                entry += f" — allowed values: {', '.join(spec.values)}"
+            allowed = values.get(name) or spec.values
+            if allowed:
+                entry += f" — allowed values: {_render_values(allowed)}"
+            elif spec.resolve is not None:
+                # Open value space: the model supplies the name it read in the
+                # query and the bridge looks up the id.
+                entry += (
+                    " — give the name exactly as the user wrote it; it is looked up "
+                    "for you. Do not invent an id."
+                )
             lines.append(entry)
     else:
         lines.append(_NO_FILTERS)
@@ -117,18 +144,22 @@ class QueryUnderstanding:
     def model_id(self) -> str:
         return self._config.model_id
 
-    def build_system_prompt(self, api: ApiConfig) -> str:
+    def build_system_prompt(
+        self, api: ApiConfig, values: dict[str, list[str]] | None = None
+    ) -> str:
         system = SYSTEM_PROMPT
         if self._config.guidance:
             system += "\n" + self._config.guidance
-        return system + "\n\n" + describe_vocabulary(api)
+        return system + "\n\n" + describe_vocabulary(api, values)
 
-    async def understand(self, api: ApiConfig, query: str) -> QueryPlan:
+    async def understand(
+        self, api: ApiConfig, query: str, values: dict[str, list[str]] | None = None
+    ) -> QueryPlan:
         """Return a structured plan for `query` against `api`."""
         response = await self._client.messages.create(
             model=self._config.model_id,
             max_tokens=self._config.max_tokens,
-            system=self.build_system_prompt(api),
+            system=self.build_system_prompt(api, values),
             thinking={"type": "adaptive"},
             output_config={
                 "effort": self._config.effort,

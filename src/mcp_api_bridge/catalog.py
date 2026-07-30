@@ -8,12 +8,20 @@ API's config, executes it, and maps the response back into `SearchResult` /
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from .auth import apply_auth
-from .config import ApiConfig, BridgeConfig, EndpointConfig, FilterConfig, SearchEndpointConfig
+from .config import (
+    ApiConfig,
+    BridgeConfig,
+    EndpointConfig,
+    FilterConfig,
+    LookupConfig,
+    SearchEndpointConfig,
+)
 from .models import CatalogItem, SearchResult
 from .paths import prune, render, resolve
 
@@ -21,6 +29,20 @@ log = logging.getLogger(__name__)
 
 # Upstream 5xx and connection failures are worth another attempt; 4xx are not.
 _RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+@dataclass(frozen=True)
+class LookupTable:
+    """A closed set of reference values.
+
+    `index` maps every accepted spelling (case-folded, aliases included) to the
+    upstream id. `names` holds just the primary labels, in their original
+    casing — that is what gets published as vocabulary to callers and to the
+    query planner.
+    """
+
+    index: dict[str, str]
+    names: list[str]
 
 
 class CatalogError(RuntimeError):
@@ -46,6 +68,9 @@ class CatalogClient:
         self._config = config
         self._http = http or httpx.AsyncClient(follow_redirects=True)
         self._owns_http = http is None
+        # Closed-set lookup tables, fetched once and held for the process
+        # lifetime; they back slow-changing reference data (regions, categories).
+        self._lookup_tables: dict[tuple[str, str], LookupTable] = {}
 
     async def aclose(self) -> None:
         if self._owns_http:
@@ -75,6 +100,7 @@ class CatalogClient:
 
         upstream_page = endpoint.first_page + (max(page, 1) - 1)
         sort_value = self._resolve_sort(endpoint, sort)
+        filters, resolutions = await self.resolve_filter_values(api, filters)
 
         ctx = {
             "query": query,
@@ -107,6 +133,7 @@ class CatalogClient:
             page_size=size,
             filters_applied=filters,
             sort=sort,
+            resolutions=resolutions,
         )
 
     async def get_item(self, api: ApiConfig, item_id: str) -> CatalogItem | None:
@@ -123,6 +150,141 @@ class CatalogClient:
         if isinstance(raw, list):
             raw = raw[0] if raw else None
         return self._map_item(raw, endpoint) if raw is not None else None
+
+    # --- filter value resolution ------------------------------------------
+
+    async def lookup_table(self, api: ApiConfig, filter_name: str) -> LookupTable:
+        """Fetch (and cache) the name -> id table for a `lookup` filter."""
+        key = (api.name, filter_name)
+        if key in self._lookup_tables:
+            return self._lookup_tables[key]
+
+        spec = api.search.filters[filter_name]
+        assert spec.lookup is not None
+        cfg: LookupConfig = spec.lookup
+
+        endpoint = EndpointConfig(method=cfg.method, path=cfg.path, query=dict(cfg.params))
+        payload = await self._request(api, endpoint, {})
+        rows = resolve(payload, cfg.items_path, default=payload)
+        if not isinstance(rows, list):
+            raise CatalogError(
+                f"lookup for filter {filter_name!r} on {api.name!r}: "
+                f"{cfg.items_path!r} did not yield a list"
+            )
+        if len(rows) > cfg.max_items:
+            raise CatalogError(
+                f"lookup for filter {filter_name!r} returned {len(rows)} rows, over the "
+                f"{cfg.max_items} cap. A set this large is not a closed set — use "
+                "`resolve` against a search endpoint instead."
+            )
+
+        index: dict[str, str] = {}
+        names: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            identifier = resolve(row, cfg.id_field)
+            if identifier is None:
+                continue
+            for position, column in enumerate((cfg.name_field, *cfg.alias_fields)):
+                label = resolve(row, column)
+                if isinstance(label, str) and label.strip():
+                    cleaned = label.strip()
+                    if cleaned.lower() not in index:
+                        index[cleaned.lower()] = str(identifier)
+                        # Only the primary column is published as vocabulary;
+                        # aliases are accepted on input but would double the
+                        # prompt for no gain.
+                        if position == 0:
+                            names.append(cleaned)
+        table = LookupTable(index=index, names=names)
+        if not index:
+            raise CatalogError(
+                f"lookup for filter {filter_name!r} on {api.name!r} produced no "
+                f"name/id pairs — check `id_field`/`name_field` against the response"
+            )
+        self._lookup_tables[key] = table
+        log.info("loaded %d %s values for %s", len(names), filter_name, api.name)
+        return table
+
+    async def vocabulary(self, api: ApiConfig) -> dict[str, list[str]]:
+        """Resolved value vocabularies, keyed by filter name.
+
+        These are what a caller — and the query planner — should choose from
+        for id-keyed filters. `resolve` filters have an open value space and
+        so contribute nothing here.
+        """
+        out: dict[str, list[str]] = {}
+        for name, spec in api.search.filters.items():
+            if spec.lookup is None:
+                continue
+            try:
+                table = await self.lookup_table(api, name)
+            except CatalogError as exc:
+                log.warning("vocabulary for %s.%s unavailable: %s", api.name, name, exc)
+                continue
+            out[name] = sorted(table.names)
+        return out
+
+    async def resolve_filter_values(
+        self, api: ApiConfig, filters: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Translate human-readable filter values into the ids the API wants.
+
+        Returns the rewritten filters plus a record of what each name resolved
+        to, so a caller can see that "Chicago" became region 5 and correct it
+        if that was the wrong Chicago.
+        """
+        resolved: dict[str, Any] = {}
+        record: dict[str, Any] = {}
+        for name, value in filters.items():
+            spec = api.search.filters.get(name)
+            if spec is None or not spec.resolves_names or value is None:
+                resolved[name] = value
+                continue
+            if isinstance(value, list):
+                pairs = [await self._resolve_one(api, name, spec, v) for v in value]
+                resolved[name] = [identifier for _, identifier in pairs]
+                record[name] = [{"name": n, "id": i} for n, i in pairs]
+            else:
+                label, identifier = await self._resolve_one(api, name, spec, value)
+                resolved[name] = identifier
+                record[name] = {"name": label, "id": identifier}
+        return resolved, record
+
+    async def _resolve_one(
+        self, api: ApiConfig, name: str, spec: FilterConfig, value: Any
+    ) -> tuple[str, str]:
+        # A caller that already holds the id should not be forced through a
+        # name lookup — pass through anything that is already the right shape.
+        if spec.type in ("integer", "number") and _looks_numeric(value):
+            return str(value), str(value)
+
+        text = str(value).strip()
+        if spec.lookup is not None:
+            table = await self.lookup_table(api, name)
+            identifier = table.index.get(text.lower())
+            if identifier is None:
+                raise CatalogError(_no_match_message(name, text, table))
+            return text, identifier
+
+        assert spec.resolve is not None
+        try:
+            target = self._config.api(spec.resolve.api)
+        except Exception as exc:
+            raise CatalogError(
+                f"filter {name!r} resolves against catalog {spec.resolve.api!r}, "
+                f"which is not configured"
+            ) from exc
+
+        found = await self.search(target, text, page_size=max(spec.resolve.take, 1))
+        if not found.items or found.items[0].id is None:
+            raise CatalogError(
+                f"filter {name!r}: nothing in catalog {spec.resolve.api!r} matched {text!r}. "
+                f"Search {spec.resolve.api!r} directly to find the right name."
+            )
+        best = found.items[0]
+        return best.title or text, str(best.id)
 
     # --- request construction ---------------------------------------------
 
@@ -290,6 +452,28 @@ def _coerce_scalar(name: str, value: Any, spec: FilterConfig) -> Any:
     except (TypeError, ValueError) as exc:
         raise CatalogError(f"filter {name!r} expects a {spec.type}, got {value!r}") from exc
     return str(value)
+
+
+def _looks_numeric(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    return isinstance(value, str) and value.strip().lstrip("-").isdigit()
+
+
+def _no_match_message(name: str, text: str, table: LookupTable) -> str:
+    import difflib
+
+    known = sorted(table.names)
+    close = difflib.get_close_matches(text, known, n=3, cutoff=0.6)
+    if not close:
+        # Fall back to the case-folded index so aliases can still match.
+        folded = difflib.get_close_matches(text.lower(), sorted(table.index), n=3, cutoff=0.6)
+        close = [c for c in folded]
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    preview = ", ".join(known[:8]) + ("…" if len(known) > 8 else "")
+    return f"filter {name!r} has no value named {text!r}.{hint} Known values include: {preview}"
 
 
 def _stringify(value: Any) -> str:
