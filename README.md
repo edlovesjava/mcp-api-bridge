@@ -67,11 +67,69 @@ Register it with an MCP client:
 }
 ```
 
+## Importing from OpenAPI
+
+Hand-writing config stops being viable fast: the bundled
+`catalog-search-service-api.json` declares **49 query parameters** on one
+operation across three sibling endpoints. `import-openapi` reads the spec and
+emits config, so the wire contract comes from the API team's own document.
+
+```bash
+# See what's in the spec
+mcp-api-bridge import-openapi catalog-search-service-api.json --list
+
+# Generate, curating the filters that reach the model
+mcp-api-bridge import-openapi catalog-search-service-api.json \
+  --operation productions=searchProductions \
+  --include productions=startDate,endDate,city,stateCode,months,minListingPriceFloor \
+  --operation performers=getPerformers \
+  --include performers=activeFilter,minProductionCount \
+  -o config/catalog.yaml
+```
+
+`config/vividseats.example.yaml` is the real output of that command.
+
+It takes from the spec: base URL, method, path, parameter names, types, enums,
+descriptions, paging defaults, the response envelope, and the auth scheme. It
+strips HTML out of descriptions first — 81 of the 150 parameter descriptions in
+that spec contain `<br/>` or `<b>`, and those strings become the model's
+vocabulary.
+
+It cannot take the **semantic roles**, because OpenAPI does not carry them:
+which parameter is the free-text query, which response field is the title,
+when each sort applies. Those are guessed by name and every guess is reported —
+to stderr as it runs, and as a comment block at the top of the generated file:
+
+```
+note: roles matched by name: query=query, page=page, page_size=pageSize, sortBy=sort — verify
+note: first_page=1 taken from the 'page' default
+TODO: base_url ...vividseats-staging.com looks non-production — confirm before deploying
+TODO: sort descriptions are blank — the spec has only raw enum values
+```
+
+**`--include` matters more than it looks.** Every filter enters the
+query-understanding prompt, so importing all 45 makes the prompt expensive and
+gives the model a wide surface to invent against. The importer nags when an
+uncurated import exceeds 15 filters.
+
+**Two things the spec cannot fix.** Twelve of the productions parameters are
+opaque IDs (`performerId`, `venueId`, `regionId`) whose own descriptions say
+they "can be looked up from the /regions API". No model can turn "Taylor Swift
+in Chicago" into `performerId=…&regionId=…` from vocabulary alone — those
+filters need an entity-resolution hop, which this bridge does not yet have. And
+that spec declares no `securitySchemes` at all, so the importer writes
+`auth: none`; if a gateway fronts the API, that is invisible here.
+
+The importer needs no dependencies beyond PyYAML — `$ref`s are resolved on
+demand with cycle guards, because real specs are cyclic (`Production` → `Venue`
+→ `Production`).
+
 ## Configuring a catalog
 
 `config/catalog.example.yaml` is a commented walkthrough of both common
 shapes: a GET search API with a nested response envelope, and a POST search
-API with body filters and zero-indexed paging. The pieces:
+API with body filters and zero-indexed paging. Generated config uses the same
+format, so anything below applies to imported catalogs too. The pieces:
 
 **Request templating.** Any value under `query:` or `body:` may contain
 `{query}`, `{page}`, `{page_size}`, or `{sort}`. A value that is exactly one
@@ -137,4 +195,7 @@ working — and `smart_search` says so in its error rather than failing silently
 ```
 
 The suite mocks the catalog HTTP layer with `respx` and stubs the Bedrock
-client, so it runs with no network and no AWS credentials.
+client, so it runs with no network and no AWS credentials. The OpenAPI tests
+run against the real `catalog-search-service-api.json` rather than a tidy
+fixture — its cyclic `$ref`s, HTML descriptions, 3.1 type unions, and missing
+security scheme each broke a first draft of the importer.
